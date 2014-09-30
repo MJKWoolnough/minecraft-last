@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"crypto/sha1"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,6 +21,7 @@ const (
 	libraryDir       = "libraries"
 	jsonExt          = ".json"
 	jarExt           = ".jar"
+	sigExt           = ".sha"
 	allow            = "allow"
 )
 
@@ -50,9 +53,10 @@ type Rule struct {
 }
 
 type Library struct {
-	Name    string            `json:"name"`
-	Rules   []Rule            `json:"rules"`
-	Natives map[string]string `json:"natives"`
+	Name    string              `json:"name"`
+	Rules   []Rule              `json:"rules"`
+	Natives map[string]string   `json:"natives"`
+	Extract map[string][]string `json:"extract"`
 }
 
 type LaunchConfig struct {
@@ -61,94 +65,100 @@ type LaunchConfig struct {
 	Class     string    `json:"mainClass"`
 }
 
+var hex = [...]byte{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'}
+
+func fail(test bool, format string, args ...interface{}) {
+	if test {
+		fmt.Fprintf(os.Stderr, format, args...)
+		os.Exit(0)
+	}
+}
+
 func main() {
 	usr, err := user.Current()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to get current user: %s\n", err)
-		return
-	}
+	fail(err != nil, "failed to get current user: %s\n", err)
+
 	minecraftDir := flag.String("minecraft", path.Join(usr.HomeDir, ".minecraft"), "Path to minecraft directory")
 	debug := flag.Bool("debug", false, "Set to show command on launch")
+	profile := flag.String("profile", "", "Selected profile to launch")
+	user := flag.String("user", "", "Selected user to launch with")
+	lastProfile := flag.Bool("lastprofile", false, "Launch last used profile")
+	lastUser := flag.Bool("lastuser", false, "Launch with last used user profile")
 	flag.Parse()
 
 	err = os.Chdir(*minecraftDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to change to minecraft directory: %s\n", err)
-		return
-	}
+	fail(err != nil, "failed to change to minecraft directory: %s\n", err)
 
 	f, err := os.Open(path.Join(*minecraftDir, launcherProfiles))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to open launcher profiles: %s\n", launcherProfiles, err)
-		return
-	}
+	fail(err != nil, "failed to open launcher profiles: %s\n", launcherProfiles, err)
 	profileData := new(ProfileData)
 	err = json.NewDecoder(f).Decode(profileData)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to decode profiles: %s\n", err)
-		return
-	}
+	fail(err != nil, "failed to decode profiles: %s\n", err)
+
 	f.Close()
 
-	versionDir := path.Join(*minecraftDir, versionsDir, profileData.Profiles[profileData.SelectedProfile].ID)
-	fi, err := os.Stat(versionDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to get information on version directory: %s\n", err)
-		return
-	} else if !fi.IsDir() {
-		fmt.Fprintf(os.Stderr, "version directory is not a directory\n")
-		return
-	}
-
-	nativesDir := ""
-	f, err = os.Open(versionDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to open version directory: %s\n", err)
-		return
-	}
-	toMatch := profileData.Profiles[profileData.SelectedProfile].ID + "-natives-"
-	for {
-		fi, err := f.Readdir(1)
-		if err != nil {
-			if err == io.EOF {
+	if *lastUser {
+		*user = profileData.SelectedUser
+	} else {
+		for uuid, u := range profileData.Users {
+			if u.Name == *user {
+				*user = uuid
 				break
 			}
-			fmt.Fprintf(os.Stderr, "failed to read version directory: %s\n", err)
-			return
-
-		}
-		if s := fi[0].Name(); len(s) >= len(toMatch) && s[:len(toMatch)] == toMatch {
-			nativesDir = s
-			break
 		}
 	}
-	if nativesDir == "" {
-		fmt.Fprintf(os.Stderr, "failed to find natives directory")
+	if _, ok := profileData.Users[*user]; !ok {
+		fmt.Fprint(os.Stderr, "incorrect or no user selected, please choose one of the following: -\n")
+		for uuid, u := range profileData.Users {
+			ext := ""
+			if uuid == profileData.SelectedUser {
+				ext = " (-lastuser)"
+			}
+			fmt.Fprintf(os.Stderr, "	%s%s\n", u.Name, ext)
+		}
+		os.Exit(0)
 	}
 
-	f, err = os.Open(path.Join(versionDir, profileData.Profiles[profileData.SelectedProfile].ID+jsonExt))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to open profile configuration: %s\n", err)
-		return
+	if *lastProfile {
+		*profile = profileData.SelectedProfile
 	}
+	if _, ok := profileData.Profiles[*profile]; !ok {
+		fmt.Fprint(os.Stderr, "incorrect or no profile selected, please choose one of the following: -\n")
+		for p := range profileData.Profiles {
+			ext := ""
+			if p == profileData.SelectedProfile {
+				ext = " (-lastprofile)"
+			}
+			fmt.Fprintf(os.Stderr, "	%s%s\n", p, ext)
+		}
+		os.Exit(0)
+	}
+
+	versionDir := path.Join(*minecraftDir, versionsDir, profileData.Profiles[*profile].ID)
+
+	f, err = os.Open(path.Join(versionDir, profileData.Profiles[*profile].ID+jsonExt))
+	fail(err != nil, "failed to open profile configuration: %s\n", err)
+
 	launchConfig := new(LaunchConfig)
 	err = json.NewDecoder(f).Decode(launchConfig)
 	f.Close()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to decode profile configuration: %s\n", err)
-		return
-	}
+	fail(err != nil, "failed to decode profile configuration: %s\n", err)
 
 	osStr := runtime.GOOS
 	switch osStr {
 	case "darwin":
 		osStr = "osx"
 	}
+
+	nativesDir := path.Join(versionDir, "natives")
+
+	os.Mkdir(nativesDir, 0755)
+
 	libraries := make([]string, 0, len(launchConfig.Libraries))
+
+	hash := sha1.New()
+
 	for _, library := range launchConfig.Libraries {
-		if library.Natives[osStr] != "" {
-			continue
-		}
 		allowed := len(library.Rules) == 0
 		for _, rule := range library.Rules {
 			if rule.OS.Name == osStr || rule.OS.Name == "" {
@@ -160,17 +170,67 @@ func main() {
 			continue
 		}
 		pieces := strings.SplitN(library.Name, ":", 2)
-		if len(pieces) != 2 {
-			fmt.Fprintf(os.Stderr, "unknown library format: %s\n", library.Name)
-			return
-		}
+		fail(len(pieces) != 2, "unknown library format: %s\n", library.Name)
+
 		librarySplit := strings.Split(pieces[1], ":")
-		filename := strings.Join(librarySplit, "-") + jarExt
 		pathSplit := append(strings.Split(pieces[0], "."), librarySplit...)
-		libraries = append(libraries, path.Join(path.Join(*minecraftDir, libraryDir), path.Join(append(pathSplit, filename)...)))
+		signature := make([]byte, 40)
+		if library.Natives[osStr] != "" {
+			filename := strings.Join(librarySplit, "-") + "-" + library.Natives[osStr] + jarExt
+			nativeLib := path.Join(path.Join(*minecraftDir, libraryDir), path.Join(append(pathSplit, filename)...))
+
+			sig, err := os.Open(nativeLib + sigExt)
+			fail(err != nil, "failed to read native library signature: %s\n", err)
+
+			_, err = io.ReadFull(sig, signature)
+			fail(err != nil, "failiure while reading native library signature: %s\n", err)
+
+			sig.Close()
+
+			f, err := os.Open(nativeLib)
+			fail(err != nil, "failed to open native library for extraction: %s\n", err)
+
+			n, err := io.Copy(hash, f)
+			fail(err != nil, "failure when reading compressed native library: %s\n", err)
+
+			for n, b := range hash.Sum(nil) {
+				fail(hex[b>>4] != signature[n<<1] || hex[b&15] != signature[n<<1+1], "signature verification failed on %s, expecting %s\n", filename, signature)
+			}
+
+			hash.Reset()
+
+			_, err = f.Seek(0, os.SEEK_SET)
+			fail(err != nil, "failure when seeking in the compressed native library: %s\n", err)
+
+			z, err := zip.NewReader(f, n)
+			fail(err != nil, "failure when opening compressed native library: %s\n", err)
+
+			excludes := library.Extract["exclude"]
+		ZipLoop:
+			for _, file := range z.File {
+				for _, exclude := range excludes {
+					if len(file.Name) >= len(exclude) && file.Name[:len(exclude)] == exclude {
+						continue ZipLoop
+					}
+				}
+				df, err := os.Create(path.Join(nativesDir, file.Name))
+				fail(err != nil, "failed to create decompressed file: %s\n", err)
+
+				cf, err := file.Open()
+				fail(err != nil, "failed to open compressed file: %s\n", err)
+
+				_, err = io.Copy(df, cf)
+				fail(err != nil, "failed to decompress file: %s\n", err)
+			}
+			f.Close()
+		} else {
+			filename := strings.Join(librarySplit, "-") + jarExt
+			lPath := path.Join(path.Join(*minecraftDir, libraryDir), path.Join(append(pathSplit, filename)...))
+			libraries = append(libraries, lPath)
+		}
 	}
 
-	libraries = append(libraries, path.Join(versionDir, profileData.Profiles[profileData.SelectedProfile].ID+jarExt))
+	libraries = append(libraries, path.Join(versionDir, profileData.Profiles[*profile].ID+jarExt))
 
 	args := []string{
 		"-Xmx1G",
@@ -178,21 +238,21 @@ func main() {
 		"-XX:+CMSIncrementalMode",
 		"-XX:-UseAdaptiveSizePolicy",
 		"-Xmn128M",
-		"-Djava.library.path=" + path.Join(versionDir, nativesDir),
+		"-Djava.library.path=" + nativesDir,
 		"-cp",
 		strings.Join(libraries, ":"),
-		"net.minecraft.launchwrapper.Launch",
+		launchConfig.Class,
 	}
 
 	ma := strings.Split(launchConfig.Args, " ")
 	for i, arg := range ma {
 		switch arg {
 		case "${auth_player_name}":
-			ma[i] = profileData.Users[profileData.SelectedUser].Name
+			ma[i] = profileData.Users[*user].Name
 		case "${auth_session}":
-			ma[i] = "token:" + profileData.Users[profileData.SelectedUser].AccessToken + ":" + profileData.SelectedUser
+			ma[i] = "token:" + profileData.Users[*user].AccessToken + ":" + *user
 		case "${version_name}":
-			ma[i] = profileData.Profiles[profileData.SelectedProfile].ID
+			ma[i] = profileData.Profiles[*profile].ID
 		case "${game_directory}":
 			ma[i] = *minecraftDir
 		case "${game_assets}":
@@ -201,7 +261,7 @@ func main() {
 	}
 	args = append(args, ma...)
 	cmd := exec.Command("java", args...)
-	fmt.Printf("Launching Minecraft, %v, with user %s\n", profileData.SelectedProfile, profileData.Users[profileData.SelectedUser].Name)
+	fmt.Printf("Launching Minecraft, %v, with user %s\n", *profile, profileData.Users[*user].Name)
 	if *debug {
 		fmt.Printf("java")
 		for _, arg := range args {
@@ -226,4 +286,6 @@ func main() {
 	go io.Copy(os.Stdout, stdout)
 	go io.Copy(os.Stderr, stderr)
 	cmd.Wait()
+	err = os.RemoveAll(nativesDir)
+	fail(err != nil, "failed to remove natives directory: %s\n", err)
 }
